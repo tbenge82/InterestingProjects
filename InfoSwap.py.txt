@@ -1,0 +1,118 @@
+#! /usr/bin/python
+
+__title__="Homework 9"
+__author__="Thomas Benge"
+__date__="04/26/13"
+
+# Program that allows users to share information over a network
+
+import sys
+import re
+import socket
+import threading
+import Queue
+from NetIO import getNetLine, putNetLine
+
+pat = re.compile(
+        '^\s*[Ss][Ww][Aa][Pp]\s+(\S+)\s+[Uu][Ss][Ii][Nn][Gg]\s+(\S+)\s*$')
+
+class handleClient(threading.Thread):
+    def __init__(self, swapDict, swapLock, strm, addr, reapQ):
+        threading.Thread.__init__(self)
+        self.dict = swapDict
+        self.lock = swapLock
+        self.strm = strm
+        self.addr = addr
+        self.repq = reapQ
+
+    def handleExchange(self, key, value):
+
+        self.lock.acquire()
+        if key in self.dict:
+            rendezvousPt = self.dict[key]
+            del self.dict[key]       # both threads still have a reference
+            self.lock.release()      # end exclusive access to self.dict
+            keyLock = rendezvousPt['cond']
+            keyLock.acquire()     # get ready to wake the 1st thread
+            newVal = value
+            value  = rendezvousPt[key]
+            rendezvousPt[key] = newVal
+            keyLock.notify()      # queue up the 1st thread
+            keyLock.release()     # start up the 1st thread
+        else:
+            keyCond = threading.Condition()
+            rendezvousPt = {key: value, 'cond': keyCond }
+            self.dict[key] = rendezvousPt
+            keyCond.acquire()     # make sure the notify can't be lost
+            self.lock.release()      # end exclusive access to self.dict
+            keyCond.wait()        # ZZZZZZZZ waiting 2nd thread
+            keyCond.release()     
+            value = rendezvousPt[key]
+        outline =  'RETURN ' + value + ' USING ' + key
+        return outline
+        
+    def run(self):
+        print "Connection open:  ", self.addr
+        sys.stdout.flush()
+        try:
+            instrm  = self.strm.makefile('r')
+            outstrm = self.strm.makefile('w')
+            inline = getNetLine(instrm)
+            while inline:
+                print self.addr, ' -> ', inline
+                mat = pat.match(inline)
+                if (mat == None):
+                    outline = '!' + inline
+                else:
+                    key = mat.group(2)
+                    value = mat.group(1)
+                    outline = self.handleExchange(key, value)                   
+                putNetLine(outstrm, outline)
+                inline = getNetLine(instrm)
+            print "Connection close: ", self.addr
+        except socket.error:
+            print "Connection error: ", self.addr
+        sys.stdout.flush()
+        instrm.close()
+        outstrm.close()
+        self.strm.close()
+        self.repq.put(self,True)
+            
+class reapEm(threading.Thread):
+    def __init__(self, threadQ):
+        threading.Thread.__init__(self)
+        self.q = threadQ
+    def run(self):
+        while True:
+            nextT = self.q.get(True)
+            nextT.join()
+    
+def serverExchanger():
+    reapQueue  = Queue.Queue()
+    reapThread = reapEm(reapQueue)
+    reapThread.daemon = True
+    reapThread.start()
+    swapDict= { }
+    swapLock = threading.Lock()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) ;
+        s.bind(('', 33101))
+        s.listen(5)
+        while True:
+            strm, addr = s.accept()
+            try:
+                nt = handleClient(swapDict,swapLock,strm,addr,reapQueue)
+                nt.daemon = True
+                nt.start()
+            except:
+                print "Unable to start thread for ", addr
+                strm.close()
+    except KeyboardInterrupt:
+        print 'Exiting'
+        for t in threading.enumerate():
+            print "Running " + str(t)
+        s.close()
+
+if __name__ == "__main__":
+    serverExchanger()
